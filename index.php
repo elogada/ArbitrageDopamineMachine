@@ -14,7 +14,6 @@ const POLL_INTERVAL_MS = 5000;      // frontend polling interval
 const PROFIT_THRESHOLD_PCT = 0.50;  // emoji threshold
 const LOCAL_EXCHANGE_NAME = 'Coins.ph';
 const ALERT_STATE_FILE = __DIR__ . '/.alert_state.json';
-const ALERT_COOLDOWN_SECONDS = 120;
 
 // Assets to compare. Binance leg is assumed to be quoted in USDT.
 // Local symbol is the Coins.ph bookTicker symbol.
@@ -35,6 +34,9 @@ define('SMTP_USERNAME', envString('SMTP_USERNAME', 'your_username'));
 define('SMTP_PASSWORD', envString('SMTP_PASSWORD', 'your_password'));
 define('SMTP_FROM_EMAIL', envString('SMTP_FROM_EMAIL', 'alerts@example.com'));
 define('SMTP_TO_EMAIL', envString('SMTP_TO_EMAIL', 'recipient@example.com'));
+define('APP_PIN', envString('APP_PIN', ''));
+
+session_start();
 
 function loadDotEnv(string $path): void
 {
@@ -103,14 +105,64 @@ function envFloat(string $key, float $default): float
     return (float) $value;
 }
 
+function isPinConfigured(): bool
+{
+    return preg_match('/^\d{4}$/', APP_PIN) === 1;
+}
+
+function isPinUnlocked(): bool
+{
+    return ($_SESSION['pin_unlocked'] ?? false) === true;
+}
+
 // ==============================
 // AJAX endpoint
 // ==============================
+if (isset($_GET['action']) && $_GET['action'] === 'logout') {
+    $_SESSION = [];
+    if (ini_get('session.use_cookies')) {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', time() - 42000, $params['path'] ?? '/', $params['domain'] ?? '', (bool) ($params['secure'] ?? false), (bool) ($params['httponly'] ?? false));
+    }
+    session_destroy();
+    header('Location: ' . basename(__FILE__));
+    exit;
+}
+
 if (isset($_GET['action']) && $_GET['action'] === 'data') {
+    if (isPinConfigured() && !isPinUnlocked()) {
+        http_response_code(401);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode([
+            'ok' => false,
+            'error' => 'PIN lock enabled. Unlock required.',
+            'timestamp' => gmdate('c'),
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode(buildPayload(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
+
+$pinError = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['pin'])) {
+    $submittedPin = trim((string) $_POST['pin']);
+    if (!isPinConfigured()) {
+        $pinError = 'PIN auth is not configured in .env.';
+    } elseif (preg_match('/^\d{4}$/', $submittedPin) !== 1) {
+        $pinError = 'PIN must be exactly 4 digits.';
+    } elseif (!hash_equals(APP_PIN, $submittedPin)) {
+        $pinError = 'Incorrect PIN.';
+    } else {
+        $_SESSION['pin_unlocked'] = true;
+        header('Location: ' . basename(__FILE__));
+        exit;
+    }
+}
+
+$pinLocked = isPinConfigured() && !isPinUnlocked();
 
 function buildPayload(): array
 {
@@ -158,83 +210,6 @@ function buildPayload(): array
         ],
         'assets' => $rows,
         'alerts' => $alertStatus,
-    ];
-}
-
-function processEmailAlerts(array $rows): array
-{
-    if (!ALERTS_ENABLED) {
-        return [
-            'enabled' => false,
-            'triggered' => false,
-            'sent' => false,
-            'message' => 'Alerts are disabled.',
-        ];
-    }
-
-    $snapshot = buildAlertSnapshot($rows);
-    $state = readAlertState();
-
-    if (!$snapshot['triggered']) {
-        $state['breachActive'] = false;
-        writeAlertState($state);
-        return [
-            'enabled' => true,
-            'triggered' => false,
-            'sent' => false,
-            'message' => 'No asset crossed the alert threshold.',
-        ];
-    }
-
-    if (($state['breachActive'] ?? false) === true) {
-        return [
-            'enabled' => true,
-            'triggered' => true,
-            'sent' => false,
-            'message' => 'Alert already sent for current threshold breach.',
-            'candidates' => $snapshot['candidates'],
-        ];
-    }
-
-    $now = time();
-    $lastSentAt = (int) ($state['lastSentAt'] ?? 0);
-    if ($lastSentAt > 0 && ($now - $lastSentAt) < ALERT_COOLDOWN_SECONDS) {
-        return [
-            'enabled' => true,
-            'triggered' => true,
-            'sent' => false,
-            'message' => 'Alert cooldown active.',
-            'candidates' => $snapshot['candidates'],
-        ];
-    }
-
-    $emailBody = renderAlertEmailBody($snapshot['candidates']);
-    $subject = 'Arbitrage Alert: ' . count($snapshot['candidates']) . ' threshold hit(s)';
-    $sendResult = smtpSendMail($subject, $emailBody);
-
-    if (!$sendResult['ok']) {
-        return [
-            'enabled' => true,
-            'triggered' => true,
-            'sent' => false,
-            'message' => 'Failed to send email alert: ' . $sendResult['error'],
-            'candidates' => $snapshot['candidates'],
-        ];
-    }
-
-    $state['lastSentAt'] = $now;
-    $state['breachActive'] = true;
-    writeAlertState($state);
-
-    return [
-        'enabled' => true,
-        'triggered' => true,
-        'sent' => true,
-        'message' => 'Email alert sent successfully.',
-        'candidates' => $snapshot['candidates'],
-    ];
-}
-
     ];
 }
 
@@ -670,10 +645,18 @@ function safeFloat(mixed $value): ?float
     <title>Arbitrage Dopamine Machine</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-white text-black min-h-screen">
-    <main class="max-w-md mx-auto px-4 py-6 text-center">
+<body
+    class="text-black min-h-screen bg-cover bg-center bg-fixed"
+    style="background-image: linear-gradient(rgba(255, 255, 255, 0.90), rgba(255, 255, 255, 0.90)), url('https://avatars.githubusercontent.com/u/15363067');"
+>
+    <main class="max-w-md mx-auto px-4 py-6 text-center relative">
         <h1 class="text-3xl font-bold tracking-tight">Arbitrage Dopamine Machine</h1>
         <p class="mt-2 text-sm">because inefficiency hits different</p>
+        <?php if (isPinConfigured() && isPinUnlocked()): ?>
+        <div class="mt-3">
+            <a href="<?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?action=logout" class="inline-block text-xs border border-black rounded px-3 py-1 hover:bg-black hover:text-white transition-colors">Logout</a>
+        </div>
+        <?php endif; ?>
 
         <section class="mt-5 border border-black rounded-xl p-4">
             <div class="text-sm">Polling interval: <span id="poll-interval" class="font-semibold"><?= htmlspecialchars((string)(POLL_INTERVAL_MS / 1000), ENT_QUOTES) ?>s</span></div>
@@ -689,9 +672,33 @@ function safeFloat(mixed $value): ?float
         <div id="cards" class="mt-4 space-y-4"></div>
     </main>
 
+    <?php if ($pinLocked): ?>
+    <div class="fixed inset-0 bg-white/95 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+        <section class="w-full max-w-sm border border-black rounded-xl p-4 bg-white text-center">
+            <h2 class="text-xl font-bold">Enter 4-digit PIN</h2>
+            <p class="mt-1 text-sm">Unlock required to continue.</p>
+            <?php if ($pinError !== ''): ?>
+                <p class="mt-2 text-sm font-semibold text-red-700"><?= htmlspecialchars($pinError, ENT_QUOTES) ?></p>
+            <?php endif; ?>
+            <form method="post" class="mt-4">
+                <input id="pin-input" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" name="pin" class="w-full border border-black rounded px-3 py-2 text-center tracking-[0.4em] text-lg" placeholder="••••" autocomplete="one-time-code" required>
+                <div class="grid grid-cols-3 gap-2 mt-3" id="keypad">
+                    <?php foreach ([1,2,3,4,5,6,7,8,9] as $digit): ?>
+                        <button type="button" class="border border-black rounded py-2 font-semibold" data-digit="<?= $digit ?>"><?= $digit ?></button>
+                    <?php endforeach; ?>
+                    <button type="button" class="border border-black rounded py-2 font-semibold" id="pin-clear">Clear</button>
+                    <button type="button" class="border border-black rounded py-2 font-semibold" data-digit="0">0</button>
+                    <button type="submit" class="border border-black rounded py-2 font-semibold bg-black text-white">OK</button>
+                </div>
+            </form>
+        </section>
+    </div>
+    <?php endif; ?>
+
 <script>
 const POLL_INTERVAL_MS = <?= json_encode(POLL_INTERVAL_MS) ?>;
 const PROFIT_THRESHOLD_PCT = <?= json_encode(PROFIT_THRESHOLD_PCT) ?>;
+const PIN_LOCKED = <?= json_encode($pinLocked) ?>;
 
 function xhrGetJson(url, onSuccess, onError) {
     const xhr = new XMLHttpRequest();
@@ -829,8 +836,34 @@ function refresh() {
     });
 }
 
-refresh();
-setInterval(refresh, POLL_INTERVAL_MS);
+if (!PIN_LOCKED) {
+    refresh();
+    setInterval(refresh, POLL_INTERVAL_MS);
+}
+
+if (PIN_LOCKED) {
+    const pinInput = document.getElementById('pin-input');
+    const keypad = document.getElementById('keypad');
+    const clearBtn = document.getElementById('pin-clear');
+
+    if (pinInput && keypad) {
+        keypad.addEventListener('click', function (event) {
+            const target = event.target;
+            if (!(target instanceof HTMLElement)) return;
+            const digit = target.dataset.digit;
+            if (!digit) return;
+            if (pinInput.value.length >= 4) return;
+            pinInput.value += digit;
+        });
+    }
+
+    if (clearBtn && pinInput) {
+        clearBtn.addEventListener('click', function () {
+            pinInput.value = '';
+            pinInput.focus();
+        });
+    }
+}
 </script>
 </body>
 </html>
