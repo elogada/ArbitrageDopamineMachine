@@ -14,6 +14,7 @@ const POLL_INTERVAL_MS = 5000;      // frontend polling interval
 const PROFIT_THRESHOLD_PCT = 0.50;  // emoji threshold
 const LOCAL_EXCHANGE_NAME = 'Coins.ph';
 const ALERT_STATE_FILE = __DIR__ . '/.alert_state.json';
+const ALERT_COOLDOWN_SECONDS = 120;
 
 // Assets to compare. Binance leg is assumed to be quoted in USDT.
 // Local symbol is the Coins.ph bookTicker symbol.
@@ -157,6 +158,83 @@ function buildPayload(): array
         ],
         'assets' => $rows,
         'alerts' => $alertStatus,
+    ];
+}
+
+function processEmailAlerts(array $rows): array
+{
+    if (!ALERTS_ENABLED) {
+        return [
+            'enabled' => false,
+            'triggered' => false,
+            'sent' => false,
+            'message' => 'Alerts are disabled.',
+        ];
+    }
+
+    $snapshot = buildAlertSnapshot($rows);
+    $state = readAlertState();
+
+    if (!$snapshot['triggered']) {
+        $state['breachActive'] = false;
+        writeAlertState($state);
+        return [
+            'enabled' => true,
+            'triggered' => false,
+            'sent' => false,
+            'message' => 'No asset crossed the alert threshold.',
+        ];
+    }
+
+    if (($state['breachActive'] ?? false) === true) {
+        return [
+            'enabled' => true,
+            'triggered' => true,
+            'sent' => false,
+            'message' => 'Alert already sent for current threshold breach.',
+            'candidates' => $snapshot['candidates'],
+        ];
+    }
+
+    $now = time();
+    $lastSentAt = (int) ($state['lastSentAt'] ?? 0);
+    if ($lastSentAt > 0 && ($now - $lastSentAt) < ALERT_COOLDOWN_SECONDS) {
+        return [
+            'enabled' => true,
+            'triggered' => true,
+            'sent' => false,
+            'message' => 'Alert cooldown active.',
+            'candidates' => $snapshot['candidates'],
+        ];
+    }
+
+    $emailBody = renderAlertEmailBody($snapshot['candidates']);
+    $subject = 'Arbitrage Alert: ' . count($snapshot['candidates']) . ' threshold hit(s)';
+    $sendResult = smtpSendMail($subject, $emailBody);
+
+    if (!$sendResult['ok']) {
+        return [
+            'enabled' => true,
+            'triggered' => true,
+            'sent' => false,
+            'message' => 'Failed to send email alert: ' . $sendResult['error'],
+            'candidates' => $snapshot['candidates'],
+        ];
+    }
+
+    $state['lastSentAt'] = $now;
+    $state['breachActive'] = true;
+    writeAlertState($state);
+
+    return [
+        'enabled' => true,
+        'triggered' => true,
+        'sent' => true,
+        'message' => 'Email alert sent successfully.',
+        'candidates' => $snapshot['candidates'],
+    ];
+}
+
     ];
 }
 

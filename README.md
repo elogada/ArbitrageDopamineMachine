@@ -24,6 +24,7 @@ How it works:
 - When any asset direction reaches or exceeds that alert threshold, it sends **one email alert** containing current spreads and emojis.
 - It will not keep spamming while the same threshold breach is still active.
 - It has a cooldown guard (`ALERT_COOLDOWN_SECONDS`) before another send is allowed (default: 300 seconds / 5 minutes).
+- It has a cooldown guard of 2 minutes before another send is allowed.
 - Once spreads go below threshold again, alert state resets and it can alert again on the next breach.
 
 Set these in `.env` (you can copy from `.env.example`):
