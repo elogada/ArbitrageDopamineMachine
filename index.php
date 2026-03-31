@@ -14,7 +14,6 @@ const POLL_INTERVAL_MS = 5000;      // frontend polling interval
 const PROFIT_THRESHOLD_PCT = 0.50;  // emoji threshold
 const LOCAL_EXCHANGE_NAME = 'Coins.ph';
 const ALERT_STATE_FILE = __DIR__ . '/.alert_state.json';
-const ALERT_COOLDOWN_SECONDS = 120;
 
 // Assets to compare. Binance leg is assumed to be quoted in USDT.
 // Local symbol is the Coins.ph bookTicker symbol.
