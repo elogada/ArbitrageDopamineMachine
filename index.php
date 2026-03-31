@@ -5,12 +5,15 @@
 
 declare(strict_types=1);
 
+loadDotEnv(__DIR__ . '/.env');
+
 // ==============================
 // Hardcoded config (edit anytime)
 // ==============================
 const POLL_INTERVAL_MS = 5000;      // frontend polling interval
 const PROFIT_THRESHOLD_PCT = 0.50;  // emoji threshold
 const LOCAL_EXCHANGE_NAME = 'Coins.ph';
+const ALERT_STATE_FILE = __DIR__ . '/.alert_state.json';
 
 // Assets to compare. Binance leg is assumed to be quoted in USDT.
 // Local symbol is the Coins.ph bookTicker symbol.
@@ -21,6 +24,83 @@ const ASSETS = [
     ['key' => 'ETH',  'binance' => 'ETHUSDT',  'local' => 'ETHPHP',  'label' => 'ETH/PHP'],
     // PAXG intentionally omitted for now because user found no PAXGPHP bookTicker on Coins.ph.
 ];
+
+define('ALERTS_ENABLED', envBool('ALERTS_ENABLED', false));
+define('ALERT_THRESHOLD_PCT', envFloat('ALERT_THRESHOLD_PCT', 1.25));
+define('ALERT_COOLDOWN_SECONDS', envInt('ALERT_COOLDOWN_SECONDS', 300));
+define('SMTP_HOST', envString('SMTP_HOST', 'smtp.example.com'));
+define('SMTP_PORT', envInt('SMTP_PORT', 465));
+define('SMTP_USERNAME', envString('SMTP_USERNAME', 'your_username'));
+define('SMTP_PASSWORD', envString('SMTP_PASSWORD', 'your_password'));
+define('SMTP_FROM_EMAIL', envString('SMTP_FROM_EMAIL', 'alerts@example.com'));
+define('SMTP_TO_EMAIL', envString('SMTP_TO_EMAIL', 'recipient@example.com'));
+
+function loadDotEnv(string $path): void
+{
+    if (!is_file($path) || !is_readable($path)) {
+        return;
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false) {
+        return;
+    }
+
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '' || str_starts_with($trimmed, '#')) {
+            continue;
+        }
+
+        [$key, $value] = array_pad(explode('=', $trimmed, 2), 2, '');
+        $key = trim($key);
+        if ($key === '') {
+            continue;
+        }
+
+        $value = trim($value);
+        $value = trim($value, "\"'");
+        putenv($key . '=' . $value);
+        $_ENV[$key] = $value;
+        $_SERVER[$key] = $value;
+    }
+}
+
+function envString(string $key, string $default): string
+{
+    $value = getenv($key);
+    if ($value === false || $value === '') {
+        return $default;
+    }
+    return (string) $value;
+}
+
+function envBool(string $key, bool $default): bool
+{
+    $value = getenv($key);
+    if ($value === false || $value === '') {
+        return $default;
+    }
+    return in_array(strtolower((string) $value), ['1', 'true', 'yes', 'on'], true);
+}
+
+function envInt(string $key, int $default): int
+{
+    $value = getenv($key);
+    if ($value === false || !is_numeric($value)) {
+        return $default;
+    }
+    return (int) $value;
+}
+
+function envFloat(string $key, float $default): float
+{
+    $value = getenv($key);
+    if ($value === false || !is_numeric($value)) {
+        return $default;
+    }
+    return (float) $value;
+}
 
 // ==============================
 // AJAX endpoint
@@ -58,12 +138,16 @@ function buildPayload(): array
         $rows[] = buildAssetRow($asset, $bridgeBid, $bridgeAsk);
     }
 
+    $alertStatus = processEmailAlerts($rows);
+
     return [
         'ok' => true,
         'timestamp' => gmdate('c'),
         'config' => [
             'pollIntervalMs' => POLL_INTERVAL_MS,
             'profitThresholdPct' => PROFIT_THRESHOLD_PCT,
+            'alertsEnabled' => ALERTS_ENABLED,
+            'alertThresholdPct' => ALERT_THRESHOLD_PCT,
             'localExchangeName' => LOCAL_EXCHANGE_NAME,
         ],
         'bridge' => [
@@ -72,7 +156,244 @@ function buildPayload(): array
             'ask' => $bridgeAsk,
         ],
         'assets' => $rows,
+        'alerts' => $alertStatus,
     ];
+}
+
+function processEmailAlerts(array $rows): array
+{
+    if (!ALERTS_ENABLED) {
+        return [
+            'enabled' => false,
+            'triggered' => false,
+            'sent' => false,
+            'message' => 'Alerts are disabled.',
+        ];
+    }
+
+    $snapshot = buildAlertSnapshot($rows);
+    $state = readAlertState();
+
+    if (!$snapshot['triggered']) {
+        $state['breachActive'] = false;
+        writeAlertState($state);
+        return [
+            'enabled' => true,
+            'triggered' => false,
+            'sent' => false,
+            'message' => 'No asset crossed the alert threshold.',
+        ];
+    }
+
+    if (($state['breachActive'] ?? false) === true) {
+        return [
+            'enabled' => true,
+            'triggered' => true,
+            'sent' => false,
+            'message' => 'Alert already sent for current threshold breach.',
+            'candidates' => $snapshot['candidates'],
+        ];
+    }
+
+    $now = time();
+    $lastSentAt = (int) ($state['lastSentAt'] ?? 0);
+    if ($lastSentAt > 0 && ($now - $lastSentAt) < ALERT_COOLDOWN_SECONDS) {
+        return [
+            'enabled' => true,
+            'triggered' => true,
+            'sent' => false,
+            'message' => 'Alert cooldown active.',
+            'candidates' => $snapshot['candidates'],
+        ];
+    }
+
+    $emailBody = renderAlertEmailBody($snapshot['candidates']);
+    $subject = 'Arbitrage Alert: ' . count($snapshot['candidates']) . ' threshold hit(s)';
+    $sendResult = smtpSendMail($subject, $emailBody);
+
+    if (!$sendResult['ok']) {
+        return [
+            'enabled' => true,
+            'triggered' => true,
+            'sent' => false,
+            'message' => 'Failed to send email alert: ' . $sendResult['error'],
+            'candidates' => $snapshot['candidates'],
+        ];
+    }
+
+    $state['lastSentAt'] = $now;
+    $state['breachActive'] = true;
+    writeAlertState($state);
+
+    return [
+        'enabled' => true,
+        'triggered' => true,
+        'sent' => true,
+        'message' => 'Email alert sent successfully.',
+        'candidates' => $snapshot['candidates'],
+    ];
+}
+
+function buildAlertSnapshot(array $rows): array
+{
+    $candidates = [];
+    foreach ($rows as $row) {
+        if (($row['ok'] ?? false) !== true) {
+            continue;
+        }
+
+        $d1 = $row['direction1']['spreadPct'] ?? null;
+        $d2 = $row['direction2']['spreadPct'] ?? null;
+        if (!is_numeric($d1) || !is_numeric($d2)) {
+            continue;
+        }
+
+        if ((float) $d1 >= ALERT_THRESHOLD_PCT || (float) $d2 >= ALERT_THRESHOLD_PCT) {
+            $candidates[] = [
+                'label' => (string) $row['label'],
+                'direction1' => [
+                    'title' => (string) $row['direction1']['title'],
+                    'spreadPct' => (float) $d1,
+                    'emoji' => (string) $row['direction1']['emoji'],
+                ],
+                'direction2' => [
+                    'title' => (string) $row['direction2']['title'],
+                    'spreadPct' => (float) $d2,
+                    'emoji' => (string) $row['direction2']['emoji'],
+                ],
+            ];
+        }
+    }
+
+    return [
+        'triggered' => count($candidates) > 0,
+        'candidates' => $candidates,
+    ];
+}
+
+function renderAlertEmailBody(array $candidates): string
+{
+    $lines = [];
+    $lines[] = 'Arbitrage alert triggered at ' . gmdate('Y-m-d H:i:s') . ' UTC';
+    $lines[] = 'Alert threshold: ' . number_format(ALERT_THRESHOLD_PCT, 2) . '%';
+    $lines[] = '';
+
+    foreach ($candidates as $asset) {
+        $lines[] = $asset['label'];
+        $lines[] = '  - ' . $asset['direction1']['title'] . ': ' . number_format((float) $asset['direction1']['spreadPct'], 2) . '% ' . $asset['direction1']['emoji'];
+        $lines[] = '  - ' . $asset['direction2']['title'] . ': ' . number_format((float) $asset['direction2']['spreadPct'], 2) . '% ' . $asset['direction2']['emoji'];
+        $lines[] = '';
+    }
+
+    return implode("\r\n", $lines);
+}
+
+function readAlertState(): array
+{
+    if (!is_file(ALERT_STATE_FILE)) {
+        return ['lastSentAt' => 0, 'breachActive' => false];
+    }
+
+    $raw = file_get_contents(ALERT_STATE_FILE);
+    if ($raw === false) {
+        return ['lastSentAt' => 0, 'breachActive' => false];
+    }
+
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        return ['lastSentAt' => 0, 'breachActive' => false];
+    }
+
+    return [
+        'lastSentAt' => (int) ($decoded['lastSentAt'] ?? 0),
+        'breachActive' => (bool) ($decoded['breachActive'] ?? false),
+    ];
+}
+
+function writeAlertState(array $state): void
+{
+    $payload = json_encode([
+        'lastSentAt' => (int) ($state['lastSentAt'] ?? 0),
+        'breachActive' => (bool) ($state['breachActive'] ?? false),
+    ], JSON_UNESCAPED_SLASHES);
+    if ($payload === false) {
+        return;
+    }
+    file_put_contents(ALERT_STATE_FILE, $payload, LOCK_EX);
+}
+
+function smtpSendMail(string $subject, string $body): array
+{
+    $transport = 'ssl://' . SMTP_HOST;
+    $socket = @stream_socket_client($transport . ':' . SMTP_PORT, $errno, $errstr, 20);
+    if ($socket === false) {
+        return ['ok' => false, 'error' => 'SMTP connect failed: ' . $errstr . ' (' . $errno . ')'];
+    }
+
+    stream_set_timeout($socket, 20);
+
+    $steps = [
+        ['expect' => '220'],
+        ['command' => 'EHLO localhost', 'expect' => '250'],
+        ['command' => 'AUTH LOGIN', 'expect' => '334'],
+        ['command' => base64_encode(SMTP_USERNAME), 'expect' => '334'],
+        ['command' => base64_encode(SMTP_PASSWORD), 'expect' => '235'],
+        ['command' => 'MAIL FROM:<' . SMTP_FROM_EMAIL . '>', 'expect' => '250'],
+        ['command' => 'RCPT TO:<' . SMTP_TO_EMAIL . '>', 'expect' => '250'],
+        ['command' => 'DATA', 'expect' => '354'],
+    ];
+
+    foreach ($steps as $step) {
+        if (isset($step['command'])) {
+            fwrite($socket, $step['command'] . "\r\n");
+        }
+
+        $response = smtpReadResponse($socket);
+        if (!str_starts_with($response, $step['expect'])) {
+            fclose($socket);
+            return ['ok' => false, 'error' => 'SMTP protocol error. Expected ' . $step['expect'] . ', got: ' . trim($response)];
+        }
+    }
+
+    $encodedSubject = '=?UTF-8?B?' . base64_encode($subject) . '?=';
+    $headers = [
+        'From: ' . SMTP_FROM_EMAIL,
+        'To: ' . SMTP_TO_EMAIL,
+        'Subject: ' . $encodedSubject,
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding: 8bit',
+    ];
+
+    $dotSafeBody = str_replace("\n.", "\n..", str_replace("\r\n", "\n", $body));
+    $message = implode("\r\n", $headers) . "\r\n\r\n" . str_replace("\n", "\r\n", $dotSafeBody) . "\r\n.\r\n";
+    fwrite($socket, $message);
+    $dataResponse = smtpReadResponse($socket);
+    if (!str_starts_with($dataResponse, '250')) {
+        fclose($socket);
+        return ['ok' => false, 'error' => 'SMTP DATA failed: ' . trim($dataResponse)];
+    }
+
+    fwrite($socket, "QUIT\r\n");
+    fclose($socket);
+
+    return ['ok' => true];
+}
+
+function smtpReadResponse($socket): string
+{
+    $response = '';
+    while (!feof($socket)) {
+        $line = fgets($socket, 1024);
+        if ($line === false) {
+            break;
+        }
+        $response .= $line;
+        if (strlen($line) >= 4 && $line[3] === ' ') {
+            break;
+        }
+    }
+    return $response;
 }
 
 function buildAssetRow(array $asset, float $usdtPhpBid, float $usdtPhpAsk): array
@@ -279,6 +600,7 @@ function safeFloat(mixed $value): ?float
         <section class="mt-5 border border-black rounded-xl p-4">
             <div class="text-sm">Polling interval: <span id="poll-interval" class="font-semibold"><?= htmlspecialchars((string)(POLL_INTERVAL_MS / 1000), ENT_QUOTES) ?>s</span></div>
             <div class="text-sm mt-1">Threshold: <span id="threshold" class="font-semibold"><?= htmlspecialchars(number_format(PROFIT_THRESHOLD_PCT, 2), ENT_QUOTES) ?>%</span></div>
+            <div class="text-sm mt-1">Email alerts: <span id="alerts-enabled" class="font-semibold"><?= ALERTS_ENABLED ? 'Enabled' : 'Disabled' ?></span></div>
             <div class="text-sm mt-1">Local exchange: <span class="font-semibold"><?= htmlspecialchars(LOCAL_EXCHANGE_NAME, ENT_QUOTES) ?></span></div>
             <div class="text-sm mt-1">Bridge: <span class="font-semibold">USDT/PHP</span></div>
             <div class="text-sm mt-2">Last updated: <span id="last-updated">—</span></div>

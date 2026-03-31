@@ -15,6 +15,33 @@ PROFIT_THRESHOLD_PCT = 0.50
 
 An emoji shows up if it goes past the profit threshold. Otherwise it just shows an X.
 
+## Email Alerts (SMTP)
+
+There is now optional SMTP email alerting with `.env` config.
+
+How it works:
+- App checks a **separate alert threshold** (`ALERT_THRESHOLD_PCT`) independent from the on-screen emoji threshold.
+- When any asset direction reaches or exceeds that alert threshold, it sends **one email alert** containing current spreads and emojis.
+- It will not keep spamming while the same threshold breach is still active.
+- It has a cooldown guard (`ALERT_COOLDOWN_SECONDS`) before another send is allowed (default: 300 seconds / 5 minutes).
+- Once spreads go below threshold again, alert state resets and it can alert again on the next breach.
+
+Set these in `.env` (you can copy from `.env.example`):
+
+```
+ALERTS_ENABLED=false
+ALERT_THRESHOLD_PCT=1.25
+ALERT_COOLDOWN_SECONDS=300
+SMTP_HOST=smtp.example.com
+SMTP_PORT=465
+SMTP_USERNAME=your_username
+SMTP_PASSWORD=your_password
+SMTP_FROM_EMAIL=alerts@example.com
+SMTP_TO_EMAIL=recipient@example.com
+```
+
+In the UI, there is a visible switch/status row: `Email alerts: Enabled/Disabled`.
+
 ## Installation
 
 You need XAMPP for this, specifically XAMPP 8.2. Get it from the Apache Friends official website. Then place the index.php in your XAMPP's htdocs folder. Hence `c:/xampp/htdocs/index.php` . Then turn on your Apache server. Then visit `http://localhost` . Serve hot.
