@@ -51,6 +51,14 @@ If your environment is Linux, you'll need PHP 8.2 and Apache, but frankly I have
 
 ## FAQ
 
+### How do I enable basic PIN auth?
+
+For basic PIN code auth, keep `APP_PIN` in your `.env` file and set it to any 4-digit PIN you want. If `APP_PIN` is not set to a valid 4-digit value, PIN lock stays disabled.
+
+### What is the default `APP_PIN`?
+
+If PIN auth is enabled using the provided `.env.example`, the default `APP_PIN` is `1234`.
+
 ### Why Windows?
 
 Too lazy to put Steam and hence OSRS on my Ubuntu. I made this on my 10 year old laptop. Heck I could imagine it would work on a phone if it only had PHP 8.2. I hear Termux lets you do that. But I'm too lazy to test.
